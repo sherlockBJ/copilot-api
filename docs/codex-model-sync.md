@@ -6,8 +6,9 @@ metadata into a local Codex catalog before starting a new session.
 
 The gateway also supports a merged remote Codex catalog and a one-time local
 export; see [the Codex guide](guides/en/codex.md). This startup helper instead
-mirrors the raw provider's explicitly advertised Responses models, excludes
-unrelated bundled catalog entries, and automates refresh and offline fallback.
+mirrors the raw provider's Responses models and supported Copilot bridges,
+excludes unrelated bundled catalog entries, and automates refresh and offline
+fallback.
 
 Requirements: Python 3.11+, a Codex CLI supporting `debug models --bundled` and
 `model_catalog_json` (tested with 0.160.0 and 0.165.0), and a running proxy.
@@ -49,8 +50,12 @@ configuration. Use `command codex` to bypass the zsh function.
 
 - The helper reads `model_provider`, `base_url`, `query_params`, `env_key`,
   `http_headers`, and `env_http_headers` from your base user configuration.
-- Only visible, enabled chat models advertising `/responses` and tool calling
-  are included. Chat Completions-only models and embeddings are excluded.
+- Enabled chat models with tool calling are included when they advertise
+  `/responses`. For the `copilot-api` provider, the helper also includes
+  `gemini-4-carbon` when it advertises `/chat/completions` and the gateway's
+  Codex-specific catalog lists it as visible and API-supported. The helper
+  uses the installed Codex CLI version to query that catalog. Other Chat
+  Completions-only models and embeddings are excluded.
 - Model IDs, display names, reasoning efforts, and input limits come from the
   provider. Codex coding instructions and local tool metadata come from its
   bundled catalog; unknown models use its generic coding template.
@@ -58,8 +63,9 @@ configuration. Use `command codex` to bypass the zsh function.
   priority service tiers, and Responses Lite support are not inherited from the
   template. A model appearing in the picker does not guarantee account access or
   that every coding tool is supported by that model.
-- Every catalog is validated by Codex before an atomic replacement. An empty,
-  malformed, or unavailable provider response leaves the previous file intact.
+- Every catalog is validated by Codex before an atomic replacement. An empty
+  usable catalog, malformed response, or failed provider request leaves the
+  previous file intact.
 - Offline launches reuse a validated previous catalog only when it belongs to
   the same provider endpoint. An initial failure or a different provider fails
   visibly instead of launching with an unrelated list.

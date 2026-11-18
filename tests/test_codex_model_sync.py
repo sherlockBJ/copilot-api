@@ -2,13 +2,15 @@
 
 import copy
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import tomllib
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 SPEC = importlib.util.spec_from_file_location(
@@ -95,6 +97,75 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(model["tool_mode"], "code_mode_only")
         self.assertEqual(model["model_messages"], bundled()["models"][1]["model_messages"])
 
+    def test_only_confirmed_copilot_bridges_are_added_to_native_models(self):
+        carbon = provider_model("gemini-4-carbon")
+        carbon["supported_endpoints"] = ["/chat/completions"]
+        other = provider_model("gemini-4-argon")
+        other["supported_endpoints"] = ["/chat/completions"]
+        native = provider_model("known-model")
+        baseline = sync.build_catalog([native], bundled())
+
+        for confirmed in (set(), {"gemini-4-carbon", "gemini-4-argon"}):
+            with self.subTest(confirmed=confirmed):
+                discover = Mock(return_value=confirmed)
+                result = sync.build_catalog(
+                    [carbon, native, other], bundled(), discover_responses_bridges=discover,
+                )
+                self.assertEqual(result["models"][0], baseline["models"][0])
+                expected = ["known-model"] + (["gemini-4-carbon"] if confirmed else [])
+                self.assertEqual([model["slug"] for model in result["models"]], expected)
+                discover.assert_called_once_with()
+
+    def test_disabled_non_tool_and_native_models_do_not_trigger_bridge_discovery(self):
+        native = provider_model("gemini-4-carbon")
+        disabled = copy.deepcopy(native)
+        disabled.update(supported_endpoints=["/chat/completions"], policy={"state": "blocked"})
+        no_tools = copy.deepcopy(native)
+        no_tools["supported_endpoints"] = ["/chat/completions"]
+        no_tools["capabilities"]["supports"]["tool_calls"] = False
+        discover = Mock()
+        result = sync.build_catalog(
+            [native, disabled, no_tools], bundled(), discover_responses_bridges=discover,
+        )
+        self.assertEqual([model["slug"] for model in result["models"]], ["gemini-4-carbon"])
+        discover.assert_not_called()
+
+    def test_copilot_catalog_uses_client_version_headers_and_visible_api_models(self):
+        request = sync.urllib.request.Request(
+            "http://127.0.0.1:4141/v1/models?provider=&client_version=0.1.0",
+            headers={"Authorization": "Bearer test", "User-Agent": "provider-client"},
+        )
+        payload = {"models": [
+            {"slug": "gemini-4-carbon", "visibility": "list", "supported_in_api": True},
+            {"slug": "hidden", "visibility": "hide", "supported_in_api": True},
+            {"slug": "not-api", "visibility": "list", "supported_in_api": False},
+        ]}
+        version = subprocess.CompletedProcess([], 0, stdout="codex-cli 0.170.0-alpha.1\n")
+        with patch.object(sync.subprocess, "run", return_value=version) as cli, patch.object(
+            sync.urllib.request, "urlopen", return_value=io.BytesIO(json.dumps(payload).encode()),
+        ) as urlopen:
+            self.assertEqual(sync.fetch_copilot_bridges(request, "codex"), {"gemini-4-carbon"})
+        self.assertEqual(cli.call_args.args[0], ["codex", "--version"])
+        sent = urlopen.call_args.args[0]
+        self.assertEqual(sent.full_url, "http://127.0.0.1:4141/v1/models?provider=&client_version=0.170.0")
+        self.assertEqual(sent.get_header("Authorization"), "Bearer test")
+        self.assertEqual(sent.get_header("User-agent"), "codex_cli_rs/0.170.0")
+
+    def test_raw_fallback_confirms_no_bridge_but_malformed_catalog_fails(self):
+        request, _ = sync.provider_settings(tomllib.loads(CONFIG))
+        version = subprocess.CompletedProcess([], 0, stdout="codex-cli 0.170.0\n")
+        with patch.object(sync.subprocess, "run", return_value=version):
+            for payload, expected in (({"data": []}, set()), ({"models": [], "has_more": True}, None),
+                                      ({"models": "invalid"}, None)):
+                with self.subTest(payload=payload), patch.object(
+                    sync.urllib.request, "urlopen", return_value=io.BytesIO(json.dumps(payload).encode()),
+                ):
+                    if expected is None:
+                        with self.assertRaises(sync.SyncError):
+                            sync.fetch_copilot_bridges(request, "codex")
+                    else:
+                        self.assertEqual(sync.fetch_copilot_bridges(request, "codex"), expected)
+
     def test_rejects_empty_catalog_duplicates_and_unknown_reasoning_levels(self):
         with self.assertRaises(sync.SyncError):
             sync.build_catalog([], bundled())
@@ -164,6 +235,26 @@ class PersistenceTests(unittest.TestCase):
                 sync.sync(self.config, self.output, "codex")
         self.assertEqual(self.output.read_bytes(), b"valid previous catalog")
         self.assertEqual(self.config.read_text(), CONFIG)
+
+    def test_sync_limits_bridge_discovery_to_copilot_and_preserves_a_valid_catalog_on_error(self):
+        carbon = provider_model("gemini-4-carbon")
+        carbon["supported_endpoints"] = ["/chat/completions"]
+        provider = [provider_model("known-model"), carbon]
+        copilot_config = CONFIG.replace('"proxy"', '"copilot-api"').replace("providers.proxy]", "providers.copilot-api]")
+        with patch.object(sync, "fetch_models", return_value=provider), patch.object(
+            sync, "native", return_value=bundled(),
+        ), patch.object(sync, "fetch_copilot_bridges", return_value={"gemini-4-carbon"}) as discover:
+            sync.sync(self.config, self.output, "codex")
+            discover.assert_not_called()
+            self.config.write_text(copilot_config)
+            catalog = sync.sync(self.config, self.output, "codex")
+            self.assertEqual([model["slug"] for model in catalog["models"]], ["known-model", "gemini-4-carbon"])
+            discover.assert_called_once()
+            previous = self.output.read_bytes()
+            discover.side_effect = OSError("bridge request failed")
+            with self.assertRaises(OSError):
+                sync.sync(self.config, self.output, "codex")
+            self.assertEqual(self.output.read_bytes(), previous)
 
     def test_changed_provider_removes_old_models_and_unchanged_response_does_not_rewrite(self):
         def native(_, args):

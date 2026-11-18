@@ -7,6 +7,7 @@ Only the Python standard library is used. Generated catalogs contain no keys.
 
 import argparse
 import copy
+from functools import partial
 import hashlib
 import json
 import os
@@ -29,6 +30,7 @@ class SyncError(Exception):
 
 
 EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+COPILOT_BRIDGED_MODELS = ("gemini-4-carbon",)
 SHELL_BEGIN = "# >>> codex provider model sync >>>"
 SHELL_END = "# <<< codex provider model sync <<<"
 MAINTENANCE = {
@@ -90,7 +92,34 @@ def fetch_models(request):
     return payload["data"]
 
 
-def build_catalog(provider_models, bundled, configured_effort=None):
+def fetch_copilot_bridges(request, executable):
+    reported_version = subprocess.run(
+        [executable, "--version"], capture_output=True, check=True, text=True, timeout=30,
+    ).stdout.strip()
+    match = re.fullmatch(r"codex-cli (\d+\.\d+\.\d+)(?:[-+]\S+)?", reported_version)
+    if not match:
+        raise SyncError("Could not determine the Codex version for the Copilot catalog.")
+    version = match[1]
+    parts = urllib.parse.urlsplit(request.full_url)
+    query = [(key, value) for key, value in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+             if key != "client_version"]
+    query.append(("client_version", version))
+    url = parts._replace(query=urllib.parse.urlencode(query)).geturl()
+    headers = dict(request.header_items())
+    headers["User-Agent"] = f"codex_cli_rs/{version}"
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=8) as response:
+        payload = json.load(response)
+    if isinstance(payload, dict) and payload.get("has_more") is not True:
+        if isinstance(payload.get("models"), list):
+            return {model["slug"] for model in payload["models"]
+                    if isinstance(model, dict) and isinstance(model.get("slug"), str)
+                    and model.get("visibility") == "list" and model.get("supported_in_api") is True}
+        if "models" not in payload and isinstance(payload.get("data"), list):
+            return set()  # A gateway without a dedicated Codex catalog confirms no bridges.
+    raise SyncError("Copilot returned an invalid or paginated Codex model catalog.")
+
+
+def build_catalog(provider_models, bundled, configured_effort=None, *, discover_responses_bridges=None):
     templates = {model["slug"]: model for model in bundled["models"]}
     fallback = templates.get("gpt-5.5")
     if not fallback:
@@ -98,7 +127,9 @@ def build_catalog(provider_models, bundled, configured_effort=None):
     if not fallback:
         raise SyncError("This Codex has no generic template for third-party models.")
     result = []
+    bridged = []
     seen = set()
+    responses_bridges = None
     for raw in provider_models:
         if not isinstance(raw, dict):
             raise SyncError("Provider returned a non-object model entry.")
@@ -115,10 +146,18 @@ def build_catalog(provider_models, bundled, configured_effort=None):
             raise SyncError("Provider model policy or endpoint metadata is malformed.")
         if (raw.get("model_picker_enabled") is False
                 or policy.get("state") in {"disabled", "blocked"}
-                or "/responses" not in endpoints
                 or caps.get("type", "chat") != "chat"
                 or supports.get("tool_calls") is not True):
             continue
+        uses_bridge = "/responses" not in endpoints
+        if uses_bridge:
+            if (discover_responses_bridges is None or model_id not in COPILOT_BRIDGED_MODELS
+                    or "/chat/completions" not in endpoints):
+                continue
+            if responses_bridges is None:
+                responses_bridges = discover_responses_bridges()
+            if model_id not in responses_bridges:
+                continue
         if not isinstance(model_id, str) or not model_id.strip() or model_id in seen:
             raise SyncError("Provider returned an empty or duplicate model ID.")
         seen.add(model_id)
@@ -134,7 +173,6 @@ def build_catalog(provider_models, bundled, configured_effort=None):
             description=f"{raw.get('vendor', 'Provider')} model from the configured Responses provider.",
             visibility="list",
             supported_in_api=True,
-            priority=len(result),
             upgrade=None,
             availability_nux=None,
             additional_speed_tiers=[],
@@ -169,9 +207,15 @@ def build_catalog(provider_models, bundled, configured_effort=None):
         if not isinstance(modalities, list) or not all(isinstance(mode, str) for mode in modalities):
             raise SyncError(f"Provider input modalities are malformed for {model_id}.")
         model["input_modalities"] = [mode for mode in modalities if mode in {"text", "image"}]
-        result.append(model)
+        if uses_bridge:
+            bridged.append(model)
+        else:
+            result.append(model)
+    result.extend(bridged)
     if not result:
         raise SyncError("Provider returned no selectable Responses models with tool calling.")
+    for priority, model in enumerate(result):
+        model["priority"] = priority
     return {"models": result}
 
 
@@ -206,7 +250,12 @@ def sync(config_path, output, executable):
     request, source = provider_settings(config)
     provider_models = fetch_models(request)
     bundled = native(executable, ["debug", "models", "--bundled"])
-    catalog = build_catalog(provider_models, bundled, config.get("model_reasoning_effort"))
+    discover = (partial(fetch_copilot_bridges, request, executable)
+                if config.get("model_provider") == "copilot-api" else None)
+    catalog = build_catalog(
+        provider_models, bundled, config.get("model_reasoning_effort"),
+        discover_responses_bridges=discover,
+    )
     catalog["provider_source_sha256"] = source
     data = (json.dumps(catalog, ensure_ascii=False, indent=2) + "\n").encode()
     changed = atomic_write(output, data, lambda path: validate_catalog(path, executable))
