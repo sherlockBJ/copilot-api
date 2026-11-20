@@ -4,21 +4,44 @@ import os from "node:os"
 import path from "node:path"
 
 import {
+  invalidateConfigCache,
+  mergeConfigWithDefaults,
+} from "~/lib/config-store"
+import {
   createHandlerLogger,
+  DEFAULT_DEBUG_PAYLOAD_MAX_CHARS,
+  DEFAULT_DEBUG_PAYLOAD_MODE,
+  DEFAULT_LOG_MAX_TOTAL_BYTES,
   debugJson,
   debugJsonAsync,
   debugJsonTail,
+  formatDebugJson,
+  getDebugPayloadMaxChars,
+  getDebugPayloadMode,
+  getLogMaxTotalBytes,
   shutdownLoggerRuntime,
 } from "~/lib/logger"
+import { PATHS } from "~/lib/paths"
 import { state } from "~/lib/state"
 
 const LOG_DIR_ENV = "COPILOT_API_LOG_DIR"
+const LOG_MAX_TOTAL_BYTES_ENV = "COPILOT_API_LOG_MAX_TOTAL_BYTES"
+const DEBUG_PAYLOAD_MODE_ENV = "COPILOT_API_DEBUG_PAYLOAD_MODE"
+const DEBUG_PAYLOAD_MAX_CHARS_ENV = "COPILOT_API_DEBUG_PAYLOAD_MAX_CHARS"
 const originalLogDir = process.env[LOG_DIR_ENV]
+const originalAppDir = PATHS.APP_DIR
+const originalConfigPath = PATHS.CONFIG_PATH
 
 afterEach(() => {
   shutdownLoggerRuntime()
   setSystemTime()
   state.verbose = false
+  PATHS.APP_DIR = originalAppDir
+  PATHS.CONFIG_PATH = originalConfigPath
+  invalidateConfigCache()
+  Reflect.deleteProperty(process.env, LOG_MAX_TOTAL_BYTES_ENV)
+  Reflect.deleteProperty(process.env, DEBUG_PAYLOAD_MODE_ENV)
+  Reflect.deleteProperty(process.env, DEBUG_PAYLOAD_MAX_CHARS_ENV)
   if (originalLogDir === undefined) {
     Reflect.deleteProperty(process.env, LOG_DIR_ENV)
   } else {
@@ -310,6 +333,240 @@ test("logger maintenance warns when an expired log cannot be removed", async () 
     shutdownLoggerRuntime()
     fs.rmSync = originalRmSync
     console.warn = originalWarn
+    fs.rmSync(logDir, {
+      recursive: true,
+      force: true,
+      maxRetries: 10,
+      retryDelay: 100,
+    })
+  }
+})
+
+test("debugJson summarizes large Responses payloads by default while keeping head and tail context", () => {
+  state.verbose = true
+  const logger = {
+    debug: mock(() => {}),
+  }
+  const sharedMeta = { source: "codex" }
+  const payload = {
+    model: "gpt-6.1-sol",
+    stream: true,
+    firstMeta: sharedMeta,
+    secondMeta: sharedMeta,
+    input: Array.from({ length: 30 }, (_, index) => ({
+      id: `item-${index}`,
+      type: index % 2 === 0 ? "reasoning" : "custom_tool_call_output",
+      encrypted_content: index % 2 === 0 ? "E".repeat(400) : undefined,
+      output:
+        index % 2 === 1 ? `prefix-${index}-${"O".repeat(900)}-tail` : undefined,
+      image:
+        index === 0 ? `data:image/png;base64,${"A".repeat(300)}` : undefined,
+    })),
+  }
+
+  debugJson(logger as never, "Responses request payload:", payload)
+
+  expect(logger.debug).toHaveBeenCalledTimes(1)
+  const serialized = String(
+    (logger.debug.mock.calls as Array<Array<unknown>>)[0]?.[1],
+  )
+  expect(serialized.length).toBeLessThanOrEqual(DEFAULT_DEBUG_PAYLOAD_MAX_CHARS)
+  expect(serialized).toContain('"item-0"')
+  expect(serialized).toContain('"item-29"')
+  expect(serialized).toContain("[... 20 items omitted, total 30]")
+  expect(serialized).toContain("[omitted 400 chars]")
+  expect(serialized).toContain("[data-url image/png ")
+  expect(serialized).toContain("... [truncated ")
+  expect(serialized).toContain('"firstMeta":{"source":"codex"}')
+  expect(serialized).toContain('"secondMeta":{"source":"codex"}')
+})
+
+test("formatDebugJson handles truncate mode, full mode, circular objects, depth, and object key caps", () => {
+  const cyclic: Record<string, unknown> = {
+    count: 42n,
+    nested: { a: { b: { c: [1, 2, 3] } } },
+  }
+  cyclic.self = cyclic
+  for (let index = 0; index < 12; index += 1) {
+    cyclic[`k${index}`] = `v-${index}-${"x".repeat(40)}`
+  }
+
+  const summarized = formatDebugJson(cyclic, {
+    mode: "summary",
+    maxDepth: 2,
+    maxObjectKeys: 5,
+    maxChars: 600,
+  })
+  expect(summarized).toContain('"count":"42"')
+  expect(summarized).toContain('"[Circular]"')
+  expect(summarized).toContain('"[Object(1 keys)]"')
+  expect(summarized).toContain('"__omittedKeys":')
+  expect(summarized.length).toBeLessThanOrEqual(600)
+
+  const truncated = formatDebugJson(
+    { text: "0123456789".repeat(80) },
+    { mode: "truncate", maxChars: 120 },
+  )
+  expect(truncated.length).toBeLessThanOrEqual(120)
+  expect(truncated).toContain("... [truncated ")
+
+  const tinyTruncated = formatDebugJson(
+    { text: "0123456789".repeat(10) },
+    { mode: "truncate", maxChars: 30 },
+  )
+  expect(tinyTruncated.length).toBe(30)
+
+  const full = formatDebugJson(cyclic, { mode: "full", maxChars: 50 })
+  expect(full).toContain('"[Circular]"')
+  expect(full.length).toBeGreaterThan(200)
+})
+
+test("logging config and environment overrides resolve with expected precedence", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilot-api-cfg-"))
+  PATHS.APP_DIR = tempDir
+  PATHS.CONFIG_PATH = path.join(tempDir, "config.json")
+
+  try {
+    expect(getDebugPayloadMode()).toBe(DEFAULT_DEBUG_PAYLOAD_MODE)
+    expect(getDebugPayloadMaxChars()).toBe(DEFAULT_DEBUG_PAYLOAD_MAX_CHARS)
+    expect(getLogMaxTotalBytes()).toBe(DEFAULT_LOG_MAX_TOTAL_BYTES)
+
+    fs.writeFileSync(
+      PATHS.CONFIG_PATH,
+      JSON.stringify({
+        logging: {
+          debugPayloadMode: "truncate",
+          debugPayloadMaxChars: 1024,
+          maxTotalBytes: 262_144,
+        },
+      }),
+      "utf8",
+    )
+    mergeConfigWithDefaults()
+
+    expect(getDebugPayloadMode()).toBe("truncate")
+    expect(getDebugPayloadMaxChars()).toBe(1024)
+    expect(getLogMaxTotalBytes()).toBe(262_144)
+
+    process.env[DEBUG_PAYLOAD_MODE_ENV] = "full"
+    process.env[DEBUG_PAYLOAD_MAX_CHARS_ENV] = "2048"
+    process.env[LOG_MAX_TOTAL_BYTES_ENV] = "524288"
+    expect(getDebugPayloadMode()).toBe("full")
+    expect(getDebugPayloadMaxChars()).toBe(2048)
+    expect(getLogMaxTotalBytes()).toBe(524_288)
+
+    // Invalid env values fall back to loaded config.
+    process.env[DEBUG_PAYLOAD_MODE_ENV] = "invalid"
+    process.env[DEBUG_PAYLOAD_MAX_CHARS_ENV] = "-5"
+    process.env[LOG_MAX_TOTAL_BYTES_ENV] = "not-a-number"
+    expect(getDebugPayloadMode()).toBe("truncate")
+    expect(getDebugPayloadMaxChars()).toBe(1024)
+    expect(getLogMaxTotalBytes()).toBe(262_144)
+
+    state.verbose = true
+    const logger = { debug: mock(() => {}) }
+    await debugJsonAsync(logger as never, "async-payload", () =>
+      Promise.resolve({ body: "z".repeat(3000) }),
+    )
+    const logged = String(
+      (logger.debug.mock.calls as Array<Array<unknown>>)[0]?.[1],
+    )
+    expect(logged.length).toBeLessThanOrEqual(1024)
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true })
+  }
+})
+
+test("log directory quota evicts oldest prior-day logs before active today logs", async () => {
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilot-api-quota-"))
+  process.env[LOG_DIR_ENV] = logDir
+  process.env[LOG_MAX_TOTAL_BYTES_ENV] = "8192"
+
+  const day1File = path.join(logDir, "responses-handler-2026-01-08.log")
+  const day2File = path.join(logDir, "responses-handler-2026-01-09.log")
+  fs.writeFileSync(day1File, `${"a".repeat(4500)}\n`, "utf8")
+  fs.writeFileSync(day2File, `${"b".repeat(4500)}\n`, "utf8")
+  fs.utimesSync(day1File, localDate(2026, 1, 8), localDate(2026, 1, 8))
+  fs.utimesSync(day2File, localDate(2026, 1, 9), localDate(2026, 1, 9))
+
+  try {
+    setSystemTime(localDate(2026, 1, 10))
+    const logger = createHandlerLogger("responses-handler")
+    for (let index = 0; index < 100; index += 1) {
+      logger.error(`day3-${index}`)
+    }
+
+    const todayFile = path.join(logDir, "responses-handler-2026-01-10.log")
+    await waitFor(() => {
+      if (!fs.existsSync(todayFile)) {
+        return false
+      }
+      const total = fs
+        .readdirSync(logDir)
+        .filter((entry) => entry.endsWith(".log"))
+        .reduce(
+          (sum, entry) => sum + fs.statSync(path.join(logDir, entry)).size,
+          0,
+        )
+      return !fs.existsSync(day1File) && total <= 8192
+    })
+
+    expect(fs.existsSync(day1File)).toBe(false)
+    expect(fs.existsSync(todayFile)).toBe(true)
+    const totalAfter = fs
+      .readdirSync(logDir)
+      .filter((entry) => entry.endsWith(".log"))
+      .reduce(
+        (sum, entry) => sum + fs.statSync(path.join(logDir, entry)).size,
+        0,
+      )
+    expect(totalAfter).toBeLessThanOrEqual(8192)
+  } finally {
+    shutdownLoggerRuntime()
+    fs.rmSync(logDir, {
+      recursive: true,
+      force: true,
+      maxRetries: 10,
+      retryDelay: 100,
+    })
+  }
+})
+
+test("log directory quota trims an oversized active log file while preserving newest entries", async () => {
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilot-api-trim-"))
+  process.env[LOG_DIR_ENV] = logDir
+  process.env[LOG_MAX_TOTAL_BYTES_ENV] = "12000"
+
+  try {
+    setSystemTime(localDate(2026, 1, 10))
+    const logger = createHandlerLogger("responses-handler")
+    for (let batch = 0; batch < 3; batch += 1) {
+      for (let index = 0; index < 100; index += 1) {
+        logger.error(`entry-${batch * 100 + index}-${"x".repeat(80)}`)
+      }
+    }
+
+    const todayFile = path.join(logDir, "responses-handler-2026-01-10.log")
+    await waitFor(() => {
+      if (!fs.existsSync(todayFile)) {
+        return false
+      }
+      const content = fs.readFileSync(todayFile, "utf8")
+      const size = fs.statSync(todayFile).size
+      return (
+        content.includes("entry-299-")
+        && content.includes("[log-quota] truncated older log entries")
+        && size <= 12_000
+      )
+    })
+
+    const finalContent = fs.readFileSync(todayFile, "utf8")
+    expect(fs.statSync(todayFile).size).toBeLessThanOrEqual(12_000)
+    expect(finalContent).toContain("[log-quota] truncated older log entries")
+    expect(finalContent).toContain("entry-299-")
+    expect(finalContent).not.toContain("entry-0-")
+  } finally {
+    shutdownLoggerRuntime()
     fs.rmSync(logDir, {
       recursive: true,
       force: true,

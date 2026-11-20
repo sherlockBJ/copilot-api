@@ -29,6 +29,7 @@ export interface AppConfig {
   // Copilot model IDs that must not request output.encrypted_content.
   noEncryptedOutputModels?: Array<string>
   upstreamTransport?: UpstreamTransportConfig
+  logging?: LoggingConfig
   anthropicApiKey?: string
   useResponsesApiWebSearch?: boolean
   alphaSearchCodexPriority?: boolean
@@ -76,6 +77,14 @@ export interface UpstreamTransportConfig {
   websocketMaxBufferedMessages?: number
   websocketOpenTimeoutMs?: number
   websocketPoolIdleTimeoutMs?: number
+}
+
+export type DebugPayloadMode = "summary" | "truncate" | "full"
+
+export interface LoggingConfig {
+  debugPayloadMode?: DebugPayloadMode
+  debugPayloadMaxChars?: number
+  maxTotalBytes?: number
 }
 
 export const defaultUpstreamTransportConfig = {
@@ -590,6 +599,12 @@ export function mergeConfigWithDefaults(): AppConfig {
 export function getConfig(): AppConfig {
   cachedConfig ??= mergeDefaultConfig(readConfigFromDisk()).mergedConfig
   return cachedConfig
+}
+
+// Returns logging settings when config has already been loaded in memory,
+// avoiding unintended config file creation during isolated logger calls.
+export function getCachedLoggingConfig(): LoggingConfig | undefined {
+  return cachedConfig?.logging
 }
 
 // Refresh this process on its next read without rewriting defaults to disk.
