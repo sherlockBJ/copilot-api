@@ -284,6 +284,149 @@ test("logger startup removes expired files", async () => {
   }
 })
 
+test("summary mode redacts short opaque fields and short base64 data URLs", () => {
+  const serialized = formatDebugJson({
+    encrypted_content: "x",
+    b64_json: "YWJjZA==",
+    signature: "sig_short_123",
+    thought_signature: "ts_short_456",
+    thoughtSignature: "E".repeat(64),
+    emptyOpaque: { encrypted_content: "" },
+    shortDataUrl: "data:image/png;base64,iVBORw0KGgo=",
+    ordinaryShortField: "keep-me",
+  })
+
+  expect(serialized).not.toContain('"x"')
+  expect(serialized).not.toContain("YWJjZA==")
+  expect(serialized).not.toContain("sig_short_123")
+  expect(serialized).not.toContain("ts_short_456")
+  expect(serialized).not.toContain("iVBORw0KGgo=")
+  expect(serialized).toContain('"encrypted_content":"[omitted 1 chars]"')
+  expect(serialized).toContain('"b64_json":"[omitted 8 chars]"')
+  expect(serialized).toContain('"signature":"[omitted 13 chars]"')
+  expect(serialized).toContain('"thought_signature":"[omitted 12 chars]"')
+  expect(serialized).toContain('"thoughtSignature":"[omitted 64 chars]"')
+  expect(serialized).toContain('"emptyOpaque":{"encrypted_content":""}')
+  expect(serialized).toContain('"shortDataUrl":"[data-url image/png 34 chars]"')
+  expect(serialized).toContain('"ordinaryShortField":"keep-me"')
+})
+
+test("startup quota cleanup preserves pre-existing same-day logs and evicts prior-day logs first", async () => {
+  const logDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), "copilot-api-startup-today-"),
+  )
+  process.env[LOG_DIR_ENV] = logDir
+  process.env[LOG_MAX_TOTAL_BYTES_ENV] = "10000"
+
+  const todayFile = path.join(logDir, "responses-handler-2026-01-10.log")
+  const yesterdayFile = path.join(logDir, "other-handler-2026-01-09.log")
+  fs.writeFileSync(
+    todayFile,
+    `earlier-today-important-entry-${"T".repeat(3200)}\n`,
+    "utf8",
+  )
+  fs.writeFileSync(yesterdayFile, `yesterday-log-${"Y".repeat(7200)}\n`, "utf8")
+  // Give the pre-existing today file an older mtime than yesterdayFile to
+  // verify active-today classification rather than mtime ordering protects it.
+  fs.utimesSync(
+    todayFile,
+    new Date(2026, 0, 10, 8, 0),
+    new Date(2026, 0, 10, 8, 0),
+  )
+  fs.utimesSync(
+    yesterdayFile,
+    new Date(2026, 0, 10, 9, 0),
+    new Date(2026, 0, 10, 9, 0),
+  )
+
+  try {
+    setSystemTime(localDate(2026, 1, 10))
+    const logger = createHandlerLogger("responses-handler")
+    for (let index = 0; index < 100; index += 1) {
+      logger.error(`after-restart-${index}`)
+    }
+
+    await waitFor(() => {
+      if (!fs.existsSync(todayFile) || fs.existsSync(yesterdayFile)) {
+        return false
+      }
+      const content = fs.readFileSync(todayFile, "utf8")
+      return content.includes("after-restart-99")
+    })
+
+    const content = fs.readFileSync(todayFile, "utf8")
+    expect(fs.existsSync(yesterdayFile)).toBe(false)
+    expect(content).toContain("earlier-today-important-entry-")
+    expect(content).toContain("after-restart-99")
+    expect(fs.statSync(todayFile).size).toBeLessThanOrEqual(10_000)
+  } finally {
+    shutdownLoggerRuntime()
+    fs.rmSync(logDir, {
+      recursive: true,
+      force: true,
+      maxRetries: 10,
+      retryDelay: 100,
+    })
+  }
+})
+
+test("startup quota cleanup tail-trims an oversized pre-existing same-day log instead of deleting it", async () => {
+  const logDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), "copilot-api-startup-trim-"),
+  )
+  process.env[LOG_DIR_ENV] = logDir
+  process.env[LOG_MAX_TOTAL_BYTES_ENV] = "16000"
+
+  const todayFile = path.join(logDir, "responses-handler-2026-01-10.log")
+  const preExistingLines = [
+    `pre-restart-head-${"H".repeat(15000)}`,
+    ...Array.from(
+      { length: 25 },
+      (_, index) => `pre-restart-tail-${index}-${"T".repeat(60)}`,
+    ),
+  ]
+  fs.writeFileSync(todayFile, `${preExistingLines.join("\n")}\n`, "utf8")
+  fs.utimesSync(
+    todayFile,
+    new Date(2026, 0, 10, 8, 0),
+    new Date(2026, 0, 10, 8, 0),
+  )
+
+  try {
+    setSystemTime(localDate(2026, 1, 10))
+    const logger = createHandlerLogger("responses-handler")
+    for (let index = 0; index < 100; index += 1) {
+      logger.error(`post-restart-${index}`)
+    }
+
+    await waitFor(() => {
+      if (!fs.existsSync(todayFile)) {
+        return false
+      }
+      const content = fs.readFileSync(todayFile, "utf8")
+      return (
+        content.includes("post-restart-99")
+        && fs.statSync(todayFile).size <= 16_000
+      )
+    })
+
+    const content = fs.readFileSync(todayFile, "utf8")
+    expect(content).toContain("[log-quota] truncated older log entries")
+    expect(content).not.toContain("pre-restart-head-")
+    expect(content).toContain("pre-restart-tail-24-")
+    expect(content).toContain("post-restart-99")
+    expect(fs.statSync(todayFile).size).toBeLessThanOrEqual(16_000)
+  } finally {
+    shutdownLoggerRuntime()
+    fs.rmSync(logDir, {
+      recursive: true,
+      force: true,
+      maxRetries: 10,
+      retryDelay: 100,
+    })
+  }
+})
+
 test("logger maintenance warns when an expired log cannot be removed", async () => {
   const logDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilot-api-logs-"))
   process.env[LOG_DIR_ENV] = logDir

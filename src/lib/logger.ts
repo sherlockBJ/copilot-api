@@ -184,9 +184,13 @@ const flushAllBuffers = () => {
   }
 }
 
-const closeLogFile = async (filePath: string): Promise<void> => {
+const closeLogFile = async (
+  filePath: string,
+  options?: { keepClosingLock?: boolean },
+): Promise<void> => {
   flushBuffer(filePath, { allowClosing: true })
   closingFiles.add(filePath)
+  let shouldReleaseLock = !options?.keepClosingLock
   try {
     const stream = logStreams.get(filePath)
     logStreams.delete(filePath)
@@ -199,10 +203,18 @@ const closeLogFile = async (filePath: string): Promise<void> => {
       stream.once("close", () => resolve())
       stream.end()
     })
+  } catch (error) {
+    shouldReleaseLock = true
+    throw error
   } finally {
-    closingFiles.delete(filePath)
+    if (shouldReleaseLock) {
+      closingFiles.delete(filePath)
+    }
   }
 }
+
+const getActiveLogDateKey = (): string =>
+  currentLogDateKey ?? new Date().toLocaleDateString("sv-SE")
 
 const closePreviousDateLogFiles = (dateKey: string): void => {
   if (currentLogDateKey === undefined) {
@@ -231,6 +243,7 @@ interface LogFileEntry {
 }
 
 const listManagedLogFiles = (logDir: string): Array<LogFileEntry> => {
+  const activeDateKey = getActiveLogDateKey()
   const files: Array<LogFileEntry> = []
   for (const entry of fs.readdirSync(logDir)) {
     if (!entry.endsWith(".log")) {
@@ -250,8 +263,9 @@ const listManagedLogFiles = (logDir: string): Array<LogFileEntry> => {
       entry,
       filePath,
       isActiveToday:
-        currentLogDateKey !== undefined
-        && entry.endsWith(`-${currentLogDateKey}.log`),
+        entry.endsWith(`-${activeDateKey}.log`)
+        || logStreams.has(filePath)
+        || (logBuffers.get(filePath)?.length ?? 0) > 0,
       mtimeMs: stats.mtimeMs,
       size: stats.size,
     })
@@ -270,9 +284,8 @@ const trimLogFileToTail = async (
   filePath: string,
   targetBytes: number,
 ): Promise<number> => {
-  await closeLogFile(filePath)
-  closingFiles.add(filePath)
   try {
+    await closeLogFile(filePath, { keepClosingLock: true })
     let stats: fs.Stats
     try {
       stats = fs.statSync(filePath)
@@ -365,18 +378,22 @@ const trimLogFileToTail = async (
 
 const removeManagedLogFile = async (filePath: string): Promise<boolean> => {
   try {
-    await closeLogFile(filePath)
-  } catch (error) {
-    console.warn(`Failed to close old handler log: ${filePath}`, error)
-    return false
-  }
+    try {
+      await closeLogFile(filePath, { keepClosingLock: true })
+    } catch (error) {
+      console.warn(`Failed to close old handler log: ${filePath}`, error)
+      return false
+    }
 
-  try {
-    fs.rmSync(filePath)
-    return true
-  } catch (error) {
-    console.warn(`Failed to remove old handler log: ${filePath}`, error)
-    return false
+    try {
+      fs.rmSync(filePath)
+      return true
+    } catch (error) {
+      console.warn(`Failed to remove old handler log: ${filePath}`, error)
+      return false
+    }
+  } finally {
+    closingFiles.delete(filePath)
   }
 }
 
@@ -517,12 +534,16 @@ export const shutdownLoggerRuntime = () => {
   runtimeInitialized = false
 }
 
-const initializeLoggerRuntime = () => {
+const initializeLoggerRuntime = (initialDateKey?: string) => {
+  if (initialDateKey !== undefined && currentLogDateKey === undefined) {
+    currentLogDateKey = initialDateKey
+  }
   if (runtimeInitialized) {
     return
   }
 
   runtimeInitialized = true
+  currentLogDateKey ??= new Date().toLocaleDateString("sv-SE")
 
   ensureLogDirectory()
   scheduleLogCleanup()
@@ -661,12 +682,12 @@ const summarizeStringValue = (
   if (
     keyName !== undefined
     && OPAQUE_DEBUG_FIELDS.has(keyName)
-    && value.length > 64
+    && value.length > 0
   ) {
     return `[omitted ${value.length} chars]`
   }
 
-  if (value.length > 128) {
+  if (value.startsWith("data:")) {
     const dataUrlMatch = BASE64_DATA_URL_PATTERN.exec(value)
     if (dataUrlMatch) {
       const mimeType = dataUrlMatch[1] || "application/octet-stream"
@@ -842,13 +863,13 @@ export const createHandlerLogger = (name: string): ConsolaInstance => {
 
   instance.addReporter({
     log(logObj) {
-      initializeLoggerRuntime()
-
       const context = requestContext.getStore()
       const traceId = context?.traceId
       const date = logObj.date
       const dateKey = date.toLocaleDateString("sv-SE")
       const timestamp = date.toLocaleString("sv-SE", { hour12: false })
+      closePreviousDateLogFiles(dateKey)
+      initializeLoggerRuntime(dateKey)
       const filePath = path.join(getLogDir(), `${sanitizedName}-${dateKey}.log`)
       const message = formatArgs(logObj.args as Array<unknown>)
       const traceIdStr = traceId ? ` [${traceId}]` : ""
@@ -856,7 +877,6 @@ export const createHandlerLogger = (name: string): ConsolaInstance => {
         message ? ` ${message}` : ""
       }`
 
-      closePreviousDateLogFiles(dateKey)
       appendLine(filePath, line)
     },
   })
