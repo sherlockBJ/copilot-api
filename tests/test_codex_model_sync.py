@@ -5,9 +5,11 @@ import importlib.util
 import io
 import json
 import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import subprocess
 import tempfile
+from threading import Thread
 import tomllib
 import unittest
 from unittest.mock import Mock, patch
@@ -142,14 +144,95 @@ class CatalogTests(unittest.TestCase):
         ]}
         version = subprocess.CompletedProcess([], 0, stdout="codex-cli 0.170.0-alpha.1\n")
         with patch.object(sync.subprocess, "run", return_value=version) as cli, patch.object(
-            sync.urllib.request, "urlopen", return_value=io.BytesIO(json.dumps(payload).encode()),
-        ) as urlopen:
+            sync, "open_provider_url", return_value=io.BytesIO(json.dumps(payload).encode()),
+        ) as opener:
             self.assertEqual(sync.fetch_copilot_bridges(request, "codex"), {"gemini-4-carbon"})
         self.assertEqual(cli.call_args.args[0], ["codex", "--version"])
-        sent = urlopen.call_args.args[0]
+        sent = opener.call_args.args[0]
         self.assertEqual(sent.full_url, "http://127.0.0.1:4141/v1/models?provider=&client_version=0.170.0")
         self.assertEqual(sent.get_header("Authorization"), "Bearer test")
         self.assertEqual(sent.get_header("User-agent"), "codex_cli_rs/0.170.0")
+
+    def test_provider_redirects_cannot_forward_credentials_to_another_origin(self):
+        request = sync.urllib.request.Request(
+            "https://provider.example/v1/models",
+            headers={"Authorization": "Bearer secret", "X-Provider-Key": "private"},
+        )
+        handler = sync.ProviderRedirectHandler()
+
+        for target in (
+            "https://attacker.example/collect",
+            "https://provider.example:444/collect",
+            "http://provider.example/collect",
+        ):
+            with self.subTest(target=target), self.assertRaisesRegex(
+                sync.SyncError, "different origin"
+            ):
+                handler.redirect_request(request, None, 302, "Found", {}, target)
+
+        same_origin = handler.redirect_request(
+            request, None, 302, "Found", {}, "https://PROVIDER.example:443/v1/catalog"
+        )
+        self.assertEqual(same_origin.full_url, "https://PROVIDER.example:443/v1/catalog")
+        self.assertEqual(same_origin.get_header("Authorization"), "Bearer secret")
+        self.assertEqual(same_origin.get_header("X-provider-key"), "private")
+
+    def test_fetch_models_does_not_send_credentials_to_cross_origin_redirect(self):
+        class RedirectHandler(BaseHTTPRequestHandler):
+            target = ""
+
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header("Location", self.target)
+                self.end_headers()
+
+            def log_message(self, _format, *args):
+                pass
+
+        class TargetHandler(BaseHTTPRequestHandler):
+            received_headers = []
+
+            def do_GET(self):
+                self.received_headers.append(dict(self.headers))
+                body = b'{"data":[]}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format, *args):
+                pass
+
+        source = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+        target = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+        RedirectHandler.target = f"http://127.0.0.1:{target.server_port}/models"
+        TargetHandler.received_headers = []
+        servers = [source, target]
+        threads = [
+            Thread(target=server.serve_forever, daemon=True)
+            for server in servers
+        ]
+        for thread in threads:
+            thread.start()
+
+        try:
+            request = sync.urllib.request.Request(
+                f"http://127.0.0.1:{source.server_port}/models",
+                headers={
+                    "Authorization": "Bearer secret",
+                    "X-Provider-Key": "private",
+                },
+            )
+            with self.assertRaisesRegex(sync.SyncError, "different origin"):
+                sync.fetch_models(request)
+            self.assertEqual(TargetHandler.received_headers, [])
+        finally:
+            for server in servers:
+                server.shutdown()
+                server.server_close()
+            for thread in threads:
+                thread.join()
 
     def test_raw_fallback_confirms_no_bridge_but_malformed_catalog_fails(self):
         request, _ = sync.provider_settings(tomllib.loads(CONFIG))
@@ -158,7 +241,7 @@ class CatalogTests(unittest.TestCase):
             for payload, expected in (({"data": []}, set()), ({"models": [], "has_more": True}, None),
                                       ({"models": "invalid"}, None)):
                 with self.subTest(payload=payload), patch.object(
-                    sync.urllib.request, "urlopen", return_value=io.BytesIO(json.dumps(payload).encode()),
+                    sync, "open_provider_url", return_value=io.BytesIO(json.dumps(payload).encode()),
                 ):
                     if expected is None:
                         with self.assertRaises(sync.SyncError):

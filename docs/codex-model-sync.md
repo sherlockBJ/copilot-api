@@ -66,6 +66,9 @@ configuration. Use `command codex` to bypass the zsh function.
 - Every catalog is validated by Codex before an atomic replacement. An empty
   usable catalog, malformed response, or failed provider request leaves the
   previous file intact.
+- Provider model requests may follow redirects only when the destination stays
+  on the same HTTP(S) origin. Cross-origin redirects are rejected so configured
+  credentials and headers are not forwarded to another server.
 - Offline launches reuse a validated previous catalog only when it belongs to
   the same provider endpoint. An initial failure or a different provider fails
   visibly instead of launching with an unrelated list.

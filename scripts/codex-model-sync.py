@@ -81,8 +81,45 @@ def provider_settings(config):
     return urllib.request.Request(request_url, headers=headers), source
 
 
+def http_origin(url):
+    try:
+        parts = urllib.parse.urlsplit(url)
+        if (
+            parts.scheme not in {"http", "https"}
+            or not parts.hostname
+            or parts.username is not None
+            or parts.password is not None
+        ):
+            return None
+        port = parts.port
+    except ValueError:
+        return None
+    return (
+        parts.scheme.lower(),
+        parts.hostname.lower(),
+        port if port is not None else (
+            443 if parts.scheme.lower() == "https" else 80
+        ),
+    )
+
+
+class ProviderRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        source = http_origin(req.full_url)
+        if source is None or http_origin(newurl) != source:
+            raise SyncError(
+                "Provider redirected to a different origin; refusing to forward credentials."
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def open_provider_url(request, timeout):
+    opener = urllib.request.build_opener(ProviderRedirectHandler())
+    return opener.open(request, timeout=timeout)
+
+
 def fetch_models(request):
-    with urllib.request.urlopen(request, timeout=8) as response:
+    with open_provider_url(request, timeout=8) as response:
         payload = json.load(response)
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
         raise SyncError("Provider /models must return an object containing a data array.")
@@ -107,7 +144,7 @@ def fetch_copilot_bridges(request, executable):
     url = parts._replace(query=urllib.parse.urlencode(query)).geturl()
     headers = dict(request.header_items())
     headers["User-Agent"] = f"codex_cli_rs/{version}"
-    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=8) as response:
+    with open_provider_url(urllib.request.Request(url, headers=headers), timeout=8) as response:
         payload = json.load(response)
     if isinstance(payload, dict) and payload.get("has_more") is not True:
         if isinstance(payload.get("models"), list):
