@@ -2188,3 +2188,87 @@ describe("responses handler interrupted streams", () => {
     ])
   })
 })
+
+describe("responses standalone function_call_output handling", () => {
+  test.each([false, true])(
+    "accepts Codex standalone function_call_output items with stream=%s",
+    async (stream) => {
+      state.models = {
+        object: "list",
+        data: [
+          {
+            capabilities: { limits: { max_prompt_tokens: 128000 } },
+            id: "gemini-4-carbon",
+            supported_endpoints: ["/v1/messages"],
+          },
+        ],
+      } as typeof state.models
+      const handleMessages = mock(
+        (_context: Context, _payload: AnthropicMessagesPayload) =>
+          Promise.resolve(
+            createMessagesResponse([
+              { type: "text", text: "Goal acknowledged" },
+            ]),
+          ),
+      )
+      responsesMessagesDependencies.handleCompletionPayload = handleMessages
+
+      const response = await createApp().request("/v1/responses", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "user-agent": "Codex/0.171.0",
+        },
+        body: JSON.stringify({
+          model: "gemini-4-carbon",
+          stream,
+          input: [
+            {
+              type: "function_call_output",
+              id: "fco_goal_1",
+              namespace: "agent",
+              name: "goal_objective",
+              output: "Finish persistent Goal verification.",
+            },
+            {
+              type: "function_call_output",
+              namespace: "codex_app",
+              name: "send_message_to_thread",
+              output: "<codex_delegation><input>hi</input></codex_delegation>",
+            },
+            { type: "message", role: "user", content: "Continue" },
+          ],
+        }),
+      })
+
+      expect(response.status).toBe(200)
+      expect(handleMessages).toHaveBeenCalledTimes(1)
+      const forwarded = handleMessages.mock.calls[0]?.[1]
+      expect(forwarded?.stream).toBe(stream)
+      const blocks = getMessageBlocks(forwarded)
+      expect(blocks).toContainEqual({
+        type: "text",
+        text: "agent.goal_objective:",
+      })
+      expect(blocks).toContainEqual({
+        type: "text",
+        text: "Finish persistent Goal verification.",
+      })
+      expect(blocks).toContainEqual({
+        type: "text",
+        text: "codex_app.send_message_to_thread:",
+      })
+      expect(blocks.some((block) => block.type === "tool_result")).toBe(false)
+      if (stream) {
+        const body = await response.text()
+        expect(body).toContain("event: response.completed")
+        expect(body).toContain("Goal acknowledged")
+      } else {
+        expect(await response.json()).toMatchObject({
+          status: "completed",
+          output_text: "Goal acknowledged",
+        })
+      }
+    },
+  )
+})

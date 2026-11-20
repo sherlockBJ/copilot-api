@@ -21,7 +21,6 @@ import type {
   AnthropicResponse,
   AnthropicTextBlock,
   AnthropicTool,
-  AnthropicToolResultContentBlock,
   AnthropicToolUseBlock,
   AnthropicUserContentBlock,
   AnthropicUserMessage,
@@ -726,6 +725,10 @@ function translateInputItems(
       }
       case "function_call_output":
       case "custom_tool_call_output": {
+        if (appendStandaloneFunctionOutput(item, messages)) {
+          userMessageSeen = true
+          break
+        }
         appendUserBlock(messages, {
           type: "tool_result",
           tool_use_id: requireStringField(item, "call_id", type),
@@ -737,7 +740,8 @@ function translateInputItems(
         })
         break
       }
-      case "additional_tools": {
+      case "additional_tools":
+      case "web_search_call": {
         break
       }
       default: {
@@ -747,6 +751,39 @@ function translateInputItems(
       }
     }
   }
+}
+
+function isStandaloneFunctionOutput(item: ResponseInputItem): boolean {
+  return (
+    isRecord(item)
+    && item.type === "function_call_output"
+    && item.call_id == null
+    && Boolean(getStringField(item, "namespace")?.trim())
+    && Boolean(getStringField(item, "name")?.trim())
+  )
+}
+
+function appendStandaloneFunctionOutput(
+  item: ResponseInputItem,
+  messages: Array<AnthropicInputMessage>,
+): boolean {
+  if (!isStandaloneFunctionOutput(item)) return false
+
+  // Named standalone outputs carry client context without a preceding tool call.
+  const content = translateToolResultContent(
+    (item as Record<string, unknown>).output,
+    "function_call_output.output",
+  )
+  appendUserBlock(messages, {
+    type: "text",
+    text: `${getStringField(item, "namespace")}.${getStringField(item, "name")}:`,
+  })
+  if (typeof content === "string") {
+    if (content) appendUserBlock(messages, { type: "text", text: content })
+  } else {
+    for (const block of content) appendUserBlock(messages, block)
+  }
+  return true
 }
 
 function translateInputMessage(
@@ -811,7 +848,9 @@ function appendDeveloperPrompts(
     if (prompts.length >= MAX_DEVELOPER_PROMPTS) break
     const type = getItemType(item)
     const role = getStringField(item, "role")
-    if (type === "agent_message") break
+    if (type === "agent_message" || isStandaloneFunctionOutput(item)) {
+      break
+    }
     if ((type === undefined || type === "message") && role === "user") break
     if ((type !== undefined && type !== "message") || role !== "developer") {
       continue
@@ -987,7 +1026,7 @@ function translateUserContentPart(
 function translateToolResultContent(
   value: unknown,
   path: string,
-): string | Array<AnthropicToolResultContentBlock> {
+): string | Array<ReturnType<typeof translateUserContentPart>> {
   if (value === undefined || value === null) return ""
   if (typeof value === "string") return value
   if (!Array.isArray(value)) {
