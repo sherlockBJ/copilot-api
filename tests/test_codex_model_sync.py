@@ -1,0 +1,404 @@
+"""Run with: python3 -m unittest discover -s tests -p 'test_codex_model_sync.py'."""
+
+import copy
+import importlib.util
+import io
+import json
+import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+import subprocess
+import tempfile
+from threading import Thread
+import tomllib
+import unittest
+from unittest.mock import Mock, patch
+
+
+SPEC = importlib.util.spec_from_file_location(
+    "codex_model_sync", Path(__file__).parents[1] / "scripts" / "codex-model-sync.py",
+)
+sync = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(sync)
+
+
+def bundled():
+    generic = {
+        "slug": "gpt-5.5", "display_name": "GPT", "shell_type": "unified_exec",
+        "supported_reasoning_levels": [{"effort": "ultra", "description": "Old capability"}],
+        "default_reasoning_level": "ultra", "visibility": "list", "supported_in_api": True,
+        "priority": 1, "support_verbosity": True, "additional_speed_tiers": ["fast"],
+        "service_tiers": [{"id": "priority"}], "upgrade": {"model": "gpt-obsolete"},
+        "truncation_policy": {"mode": "tokens", "limit": 10000},
+        "experimental_supported_tools": [], "context_window": 1000000,
+        "base_instructions": "You are Codex, a coding agent based on GPT-5. Keep changes focused.",
+        "model_messages": {"instructions_template": "Model-specific instructions"},
+    }
+    known = copy.deepcopy(generic)
+    known.update(slug="known-model", tool_mode="code_mode_only")
+    return {"models": [generic, known]}
+
+
+def provider_model(model_id="new-model"):
+    return {
+        "id": model_id, "name": "Provider model", "vendor": "Example",
+        "model_picker_enabled": True, "supported_endpoints": ["/responses"],
+        "capabilities": {"type": "chat", "supports": {"tool_calls": True}},
+        "reasoning_efforts": ["low", "medium", "high"],
+        "context_window": 256000, "input_limit": 128000,
+        "input_modalities": ["text", "image"],
+    }
+
+
+CONFIG = '''# Keep this comment.
+model = "known-model"
+model_provider = "proxy"
+model_reasoning_effort = "high"
+
+[model_providers.proxy]
+base_url = "http://127.0.0.1:4141/v1"
+wire_api = "responses"
+
+[projects."/some/project"]
+trust_level = "trusted"
+'''
+
+
+class CatalogTests(unittest.TestCase):
+    def test_filters_incompatible_models_and_uses_provider_limits(self):
+        chat = provider_model("chat-only")
+        chat["supported_endpoints"] = ["/chat/completions"]
+        embedding = provider_model("embedding")
+        embedding["capabilities"]["type"] = "embeddings"
+        disabled = provider_model("disabled")
+        disabled["policy"] = {"state": "disabled"}
+        no_tools = provider_model("no-tools")
+        no_tools["capabilities"]["supports"]["tool_calls"] = False
+        hidden = provider_model("hidden")
+        hidden["model_picker_enabled"] = False
+        catalog = sync.build_catalog(
+            [chat, embedding, disabled, no_tools, hidden, provider_model()], bundled(), "high",
+        )
+        self.assertEqual(len(catalog["models"]), 1)
+        model = catalog["models"][0]
+        self.assertEqual(model["slug"], "new-model")
+        self.assertEqual(model["context_window"], 128000)
+        self.assertEqual(model["max_context_window"], 128000)
+        self.assertEqual([x["effort"] for x in model["supported_reasoning_levels"]], ["low", "medium", "high"])
+        self.assertEqual(model["default_reasoning_level"], "high")
+        self.assertEqual(model["additional_speed_tiers"], [])
+        self.assertEqual(model["service_tiers"], [])
+        self.assertIsNone(model["upgrade"])
+        self.assertFalse(model["supports_search_tool"])
+        self.assertFalse(model["use_responses_lite"])
+        self.assertNotIn("GPT-5", model["base_instructions"])
+        self.assertNotIn("model_messages", model)
+
+    def test_known_models_keep_their_coding_instructions_and_tool_configuration(self):
+        model = sync.build_catalog([provider_model("known-model")], bundled())["models"][0]
+        self.assertEqual(model["tool_mode"], "code_mode_only")
+        self.assertEqual(model["model_messages"], bundled()["models"][1]["model_messages"])
+
+    def test_only_confirmed_copilot_bridges_are_added_to_native_models(self):
+        carbon = provider_model("gemini-4-carbon")
+        carbon["supported_endpoints"] = ["/chat/completions"]
+        other = provider_model("gemini-4-argon")
+        other["supported_endpoints"] = ["/chat/completions"]
+        native = provider_model("known-model")
+        baseline = sync.build_catalog([native], bundled())
+
+        for confirmed in (set(), {"gemini-4-carbon", "gemini-4-argon"}):
+            with self.subTest(confirmed=confirmed):
+                discover = Mock(return_value=confirmed)
+                result = sync.build_catalog(
+                    [carbon, native, other], bundled(), discover_responses_bridges=discover,
+                )
+                self.assertEqual(result["models"][0], baseline["models"][0])
+                expected = ["known-model"] + (["gemini-4-carbon"] if confirmed else [])
+                self.assertEqual([model["slug"] for model in result["models"]], expected)
+                discover.assert_called_once_with()
+
+    def test_disabled_non_tool_and_native_models_do_not_trigger_bridge_discovery(self):
+        native = provider_model("gemini-4-carbon")
+        disabled = copy.deepcopy(native)
+        disabled.update(supported_endpoints=["/chat/completions"], policy={"state": "blocked"})
+        no_tools = copy.deepcopy(native)
+        no_tools["supported_endpoints"] = ["/chat/completions"]
+        no_tools["capabilities"]["supports"]["tool_calls"] = False
+        discover = Mock()
+        result = sync.build_catalog(
+            [native, disabled, no_tools], bundled(), discover_responses_bridges=discover,
+        )
+        self.assertEqual([model["slug"] for model in result["models"]], ["gemini-4-carbon"])
+        discover.assert_not_called()
+
+    def test_copilot_catalog_uses_client_version_headers_and_visible_api_models(self):
+        request = sync.urllib.request.Request(
+            "http://127.0.0.1:4141/v1/models?provider=&client_version=0.1.0",
+            headers={"Authorization": "Bearer test", "User-Agent": "provider-client"},
+        )
+        payload = {"models": [
+            {"slug": "gemini-4-carbon", "visibility": "list", "supported_in_api": True},
+            {"slug": "hidden", "visibility": "hide", "supported_in_api": True},
+            {"slug": "not-api", "visibility": "list", "supported_in_api": False},
+        ]}
+        version = subprocess.CompletedProcess([], 0, stdout="codex-cli 0.170.0-alpha.1\n")
+        with patch.object(sync.subprocess, "run", return_value=version) as cli, patch.object(
+            sync, "open_provider_url", return_value=io.BytesIO(json.dumps(payload).encode()),
+        ) as opener:
+            self.assertEqual(sync.fetch_copilot_bridges(request, "codex"), {"gemini-4-carbon"})
+        self.assertEqual(cli.call_args.args[0], ["codex", "--version"])
+        sent = opener.call_args.args[0]
+        self.assertEqual(sent.full_url, "http://127.0.0.1:4141/v1/models?provider=&client_version=0.170.0")
+        self.assertEqual(sent.get_header("Authorization"), "Bearer test")
+        self.assertEqual(sent.get_header("User-agent"), "codex_cli_rs/0.170.0")
+
+    def test_provider_redirects_cannot_forward_credentials_to_another_origin(self):
+        request = sync.urllib.request.Request(
+            "https://provider.example/v1/models",
+            headers={"Authorization": "Bearer secret", "X-Provider-Key": "private"},
+        )
+        handler = sync.ProviderRedirectHandler()
+
+        for target in (
+            "https://attacker.example/collect",
+            "https://provider.example:444/collect",
+            "http://provider.example/collect",
+        ):
+            with self.subTest(target=target), self.assertRaisesRegex(
+                sync.SyncError, "different origin"
+            ):
+                handler.redirect_request(request, None, 302, "Found", {}, target)
+
+        same_origin = handler.redirect_request(
+            request, None, 302, "Found", {}, "https://PROVIDER.example:443/v1/catalog"
+        )
+        self.assertEqual(same_origin.full_url, "https://PROVIDER.example:443/v1/catalog")
+        self.assertEqual(same_origin.get_header("Authorization"), "Bearer secret")
+        self.assertEqual(same_origin.get_header("X-provider-key"), "private")
+
+    def test_fetch_models_does_not_send_credentials_to_cross_origin_redirect(self):
+        class RedirectHandler(BaseHTTPRequestHandler):
+            target = ""
+
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header("Location", self.target)
+                self.end_headers()
+
+            def log_message(self, _format, *args):
+                pass
+
+        class TargetHandler(BaseHTTPRequestHandler):
+            received_headers = []
+
+            def do_GET(self):
+                self.received_headers.append(dict(self.headers))
+                body = b'{"data":[]}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format, *args):
+                pass
+
+        source = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+        target = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+        RedirectHandler.target = f"http://127.0.0.1:{target.server_port}/models"
+        TargetHandler.received_headers = []
+        servers = [source, target]
+        threads = [
+            Thread(target=server.serve_forever, daemon=True)
+            for server in servers
+        ]
+        for thread in threads:
+            thread.start()
+
+        try:
+            request = sync.urllib.request.Request(
+                f"http://127.0.0.1:{source.server_port}/models",
+                headers={
+                    "Authorization": "Bearer secret",
+                    "X-Provider-Key": "private",
+                },
+            )
+            with self.assertRaisesRegex(sync.SyncError, "different origin"):
+                sync.fetch_models(request)
+            self.assertEqual(TargetHandler.received_headers, [])
+        finally:
+            for server in servers:
+                server.shutdown()
+                server.server_close()
+            for thread in threads:
+                thread.join()
+
+    def test_raw_fallback_confirms_no_bridge_but_malformed_catalog_fails(self):
+        request, _ = sync.provider_settings(tomllib.loads(CONFIG))
+        version = subprocess.CompletedProcess([], 0, stdout="codex-cli 0.170.0\n")
+        with patch.object(sync.subprocess, "run", return_value=version):
+            for payload, expected in (({"data": []}, set()), ({"models": [], "has_more": True}, None),
+                                      ({"models": "invalid"}, None)):
+                with self.subTest(payload=payload), patch.object(
+                    sync, "open_provider_url", return_value=io.BytesIO(json.dumps(payload).encode()),
+                ):
+                    if expected is None:
+                        with self.assertRaises(sync.SyncError):
+                            sync.fetch_copilot_bridges(request, "codex")
+                    else:
+                        self.assertEqual(sync.fetch_copilot_bridges(request, "codex"), expected)
+
+    def test_rejects_empty_catalog_duplicates_and_unknown_reasoning_levels(self):
+        with self.assertRaises(sync.SyncError):
+            sync.build_catalog([], bundled())
+        with self.assertRaises(sync.SyncError):
+            sync.build_catalog([provider_model(), provider_model()], bundled())
+        model = provider_model()
+        model["reasoning_efforts"] = ["future-effort"]
+        with self.assertRaises(sync.SyncError):
+            sync.build_catalog([model], bundled())
+        model["reasoning_efforts"] = [{"effort": "high"}]
+        with self.assertRaises(sync.SyncError):
+            sync.build_catalog([model], bundled())
+
+    def test_no_reasoning_does_not_inherit_template_reasoning_levels(self):
+        model = provider_model()
+        model["reasoning_efforts"] = []
+        result = sync.build_catalog([model], bundled())["models"][0]
+        self.assertEqual(result["supported_reasoning_levels"], [])
+        self.assertIsNone(result["default_reasoning_level"])
+
+    def test_malformed_provider_metadata_is_reported_as_a_sync_failure(self):
+        cases = [("policy", []), ("supported_endpoints", 42), ("input_modalities", None)]
+        for field, value in cases:
+            model = provider_model()
+            model[field] = value
+            # Empty policy is treated as an absent policy.
+            if field == "policy":
+                model[field] = ["invalid-policy"]
+            with self.subTest(field=field), self.assertRaises(sync.SyncError):
+                sync.build_catalog([model], bundled())
+
+    def test_source_fingerprint_omits_credentials_and_distinguishes_providers(self):
+        config = tomllib.loads(CONFIG)
+        provider = config["model_providers"]["proxy"]
+        provider.update(env_key="SYNC_TEST_KEY", env_http_headers={"X-Test": "SYNC_TEST_HEADER"})
+        with patch.dict(os.environ, {"SYNC_TEST_KEY": "secret-token", "SYNC_TEST_HEADER": "secret-header"}):
+            request, source = sync.provider_settings(config)
+            self.assertEqual(request.get_header("Authorization"), "Bearer secret-token")
+            self.assertEqual(len(source), 64)
+            self.assertNotIn("secret", source)
+            provider["base_url"] = "http://127.0.0.1:4545/v1"
+            self.assertNotEqual(source, sync.provider_settings(config)[1])
+
+
+class PersistenceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.config = self.root / "config.toml"
+        self.config.write_text(CONFIG)
+        self.output = self.root / "provider-models.json"
+
+    def test_native_validation_failure_keeps_previous_catalog_and_removes_temporary_file(self):
+        self.output.write_bytes(b"old catalog")
+        def reject(_):
+            raise sync.SyncError("incompatible catalog")
+        with self.assertRaises(sync.SyncError):
+            sync.atomic_write(self.output, b"new catalog", reject)
+        self.assertEqual(self.output.read_bytes(), b"old catalog")
+        self.assertEqual(list(self.root.glob(".provider-models.json*")), [])
+
+    def test_failed_or_empty_provider_response_never_replaces_valid_catalog(self):
+        self.output.write_bytes(b"valid previous catalog")
+        with patch.object(sync, "fetch_models", return_value=[]), patch.object(sync, "native", return_value=bundled()):
+            with self.assertRaises(sync.SyncError):
+                sync.sync(self.config, self.output, "codex")
+        self.assertEqual(self.output.read_bytes(), b"valid previous catalog")
+        self.assertEqual(self.config.read_text(), CONFIG)
+
+    def test_sync_limits_bridge_discovery_to_copilot_and_preserves_a_valid_catalog_on_error(self):
+        carbon = provider_model("gemini-4-carbon")
+        carbon["supported_endpoints"] = ["/chat/completions"]
+        provider = [provider_model("known-model"), carbon]
+        copilot_config = CONFIG.replace('"proxy"', '"copilot-api"').replace("providers.proxy]", "providers.copilot-api]")
+        with patch.object(sync, "fetch_models", return_value=provider), patch.object(
+            sync, "native", return_value=bundled(),
+        ), patch.object(sync, "fetch_copilot_bridges", return_value={"gemini-4-carbon"}) as discover:
+            sync.sync(self.config, self.output, "codex")
+            discover.assert_not_called()
+            self.config.write_text(copilot_config)
+            catalog = sync.sync(self.config, self.output, "codex")
+            self.assertEqual([model["slug"] for model in catalog["models"]], ["known-model", "gemini-4-carbon"])
+            discover.assert_called_once()
+            previous = self.output.read_bytes()
+            discover.side_effect = OSError("bridge request failed")
+            with self.assertRaises(OSError):
+                sync.sync(self.config, self.output, "codex")
+            self.assertEqual(self.output.read_bytes(), previous)
+
+    def test_changed_provider_removes_old_models_and_unchanged_response_does_not_rewrite(self):
+        def native(_, args):
+            return bundled() if "--bundled" in args else {}
+        with patch.object(sync, "fetch_models", return_value=[provider_model("old")]), patch.object(sync, "native", side_effect=native):
+            sync.sync(self.config, self.output, "codex")
+        with patch.object(sync, "fetch_models", return_value=[provider_model("new")]), patch.object(sync, "native", side_effect=native):
+            sync.sync(self.config, self.output, "codex")
+            before = self.output.stat().st_mtime_ns
+            sync.sync(self.config, self.output, "codex")
+            self.assertEqual(self.output.stat().st_mtime_ns, before)
+        self.assertEqual([m["slug"] for m in json.loads(self.output.read_text())["models"]], ["new"])
+
+    def test_config_edit_preserves_unrelated_settings_and_is_idempotent(self):
+        result = sync.config_with_catalog(CONFIG, self.output)
+        before = tomllib.loads(CONFIG)
+        after = tomllib.loads(result)
+        self.assertEqual(after.pop("model_catalog_json"), str(self.output))
+        self.assertEqual(before, after)
+        self.assertIn("# Keep this comment.", result)
+        self.assertEqual(sync.config_with_catalog(result, self.output), result)
+
+    def test_offline_launch_uses_same_provider_cache_and_a_fresh_backend(self):
+        catalog = sync.build_catalog([provider_model()], bundled())
+        catalog["provider_source_sha256"] = sync.provider_settings(tomllib.loads(CONFIG))[1]
+        self.output.write_text(json.dumps(catalog))
+        with patch.object(sync, "sync", side_effect=OSError("connection refused")), patch.object(sync, "native", return_value=catalog), patch.object(sync.os, "execv") as launch:
+            code = sync.main(["--config", str(self.config), "--codex-bin", "/real/codex", "--launch", "resume", "session-id"])
+        self.assertEqual(code, 0)
+        args = launch.call_args.args[1]
+        self.assertIn("--no-daemon", args)
+        self.assertEqual(args[-2:], ["resume", "session-id"])
+
+    def test_offline_launch_refuses_a_catalog_from_another_provider(self):
+        self.output.write_text(json.dumps({"provider_source_sha256": "other-provider", "models": []}))
+        with patch.object(sync, "sync", side_effect=OSError("connection refused")), patch.object(sync.os, "execv") as launch:
+            code = sync.main(["--config", str(self.config), "--codex-bin", "/real/codex", "--launch", "resume"])
+        self.assertEqual(code, 1)
+        launch.assert_not_called()
+
+    def test_launcher_separator_and_maintenance_command_do_not_require_provider_access(self):
+        with patch.object(sync.os, "execv") as launch, patch.object(sync, "sync") as refresh:
+            code = sync.main(["--config", str(self.root / "missing.toml"), "--codex-bin", "/real/codex", "--launch", "--", "--version"])
+        self.assertEqual(code, 0)
+        launch.assert_called_once_with("/real/codex", ["/real/codex", "--version"])
+        refresh.assert_not_called()
+
+    def test_install_is_repeatable_and_keeps_original_backups(self):
+        shell_rc = self.root / ".zshrc"
+        shell_rc.write_text("# User shell settings\n")
+        with patch.object(sync.Path, "home", return_value=self.root), patch.object(sync, "sync"):
+            sync.install(self.config, self.output, "codex", shell_rc)
+            sync.install(self.config, self.output, "codex", shell_rc)
+        self.assertEqual(shell_rc.read_text().count(sync.SHELL_BEGIN), 1)
+        backups = sorted((self.root / "backups").iterdir())
+        self.assertEqual(len(backups), 2)
+        self.assertEqual((backups[0] / "config.toml").read_text(), CONFIG)
+        launcher = self.root / ".local" / "bin" / "codex-synced"
+        self.assertIn("--launch --", launcher.read_text())
+        self.assertEqual(launcher.stat().st_mode & 0o777, 0o700)
+
+
+if __name__ == "__main__":
+    unittest.main()

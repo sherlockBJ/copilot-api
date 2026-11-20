@@ -27,3 +27,6 @@ dist/
 
 # mac
 .DS_Store
+
+# Python helper scripts
+__pycache__/
