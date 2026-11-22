@@ -3,6 +3,7 @@ import type { Context } from "hono"
 
 import { streamSSE, type SSEMessage } from "hono/streaming"
 
+import { limitChatCompletionsPromptImages } from "~/lib/chat-completions-images"
 import { resolveMappedModel } from "~/lib/config"
 import { recordChatCompletionFirstToken } from "~/lib/first-token"
 import { createHandlerLogger, debugJson } from "~/lib/logger"
@@ -70,6 +71,18 @@ export async function handleCompletion(c: Context) {
       payload.max_completion_tokens = payload.max_tokens
     }
     delete payload.max_tokens
+  }
+
+  const maxPromptImages =
+    selectedModel?.capabilities.limits.vision?.max_prompt_images
+  const omittedImageCount = limitChatCompletionsPromptImages(
+    payload,
+    maxPromptImages,
+  )
+  if (omittedImageCount > 0) {
+    logger.warn(
+      `Omitted ${omittedImageCount} earlier prompt image(s) to stay within max_prompt_images=${maxPromptImages} for model ${payload.model}`,
+    )
   }
 
   // not support subagent marker for now , set sessionId = getUUID(requestId)

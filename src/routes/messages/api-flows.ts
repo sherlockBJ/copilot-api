@@ -7,6 +7,7 @@ import type { CompactType } from "~/lib/compact"
 import type { SubagentMarker } from "~/lib/subagent"
 import type { Model } from "~/lib/types/models"
 
+import { limitChatCompletionsPromptImages } from "~/lib/chat-completions-images"
 import { getRawProviderConfig } from "~/lib/config"
 import {
   recordAnthropicFirstToken,
@@ -135,7 +136,15 @@ export const handleWithChatCompletions = async (
     reasoningEffortSupport:
       selectedModel?.capabilities.supports.reasoning_effort,
   })
-  prepareCopilotChatCompletionsPayload(openAIPayload)
+  const omittedImageCount = prepareCopilotChatCompletionsPayload(
+    openAIPayload,
+    selectedModel,
+  )
+  if (omittedImageCount > 0) {
+    logger.warn(
+      `Omitted ${omittedImageCount} earlier prompt image(s) to stay within max_prompt_images=${selectedModel?.capabilities.limits.vision?.max_prompt_images} for model ${openAIPayload.model}`,
+    )
+  }
   const recordUsage = createCopilotUsageRecorder({
     endpoint: options.usageEndpoint ?? "chat_completions",
     fallbackSessionId: sessionId,
@@ -491,8 +500,14 @@ export const handleWithMessagesApi = async (
 
 export const prepareCopilotChatCompletionsPayload = (
   payload: ChatCompletionsPayload,
-): void => {
+  selectedModel?: Model,
+): number => {
+  const omittedImageCount = limitChatCompletionsPromptImages(
+    payload,
+    selectedModel?.capabilities.limits.vision?.max_prompt_images,
+  )
   applyCopilotContextCache(payload)
+  return omittedImageCount
 }
 
 const applyCopilotContextCache = (payload: ChatCompletionsPayload): void => {
